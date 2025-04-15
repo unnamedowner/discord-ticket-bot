@@ -1,132 +1,116 @@
 
-import os
 import discord
-from discord.ext import commands, tasks
-import time
-from discord.ui import View, Button
+from discord.ext import tasks, commands
+import os
+import asyncio
+from datetime import datetime, timezone
+from collections import defaultdict
 
-OUTPUT_CHANNEL_ID = 1361521776760328253
+TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = 1361521776760328253
 SUPPORT_ROLE_NAME = "support"
-MAX_DESCRIPTION_LENGTH = 4000
-last_refresh_time = 0
+UPDATE_INTERVAL = 120  # каждые 2 минуты
+UPDATE_COOLDOWN = 10  # минимальное время между ручными обновлениями (сек)
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+intents.messages = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
-embed_messages = []
+bot = commands.Bot(command_prefix="!", intents=intents)
+last_manual_update = 0
 
-class RefreshView(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(RefreshButton())
-
-class RefreshButton(Button):
-    def __init__(self):
-        super().__init__(style=discord.ButtonStyle.primary, label="🔄 Обновить вручную")
-
-    async def callback(self, interaction: discord.Interaction):
-        global last_refresh_time
-        now = time.time()
-        if now - last_refresh_time < 10:
-            await interaction.response.send_message("⏱ Подожди немного перед повторной попыткой (10 секунд)", ephemeral=True)
+def group_by_age(ticket_data):
+    now = datetime.now(timezone.utc)
+    groups = {
+        "🔥 Старше 1 дня (1440+ мин)": [],
+        "🟡 От 1 до 3 часов (60–180 мин)": [],
+        "🟢 Менее часа": []
+    }
+    for channel, author, minutes in sorted(ticket_data, key=lambda x: x[2], reverse=True):
+        if minutes >= 1440:
+            groups["🔥 Старше 1 дня (1440+ мин)"].append((channel, author, minutes))
+        elif 60 <= minutes < 1440:
+            groups["🟡 От 1 до 3 часов (60–180 мин)"].append((channel, author, minutes))
         else:
-            last_refresh_time = now
-            await interaction.response.send_message("🔄 Обновляю тикеты...", ephemeral=True)
-            await update_embed()
+            groups["🟢 Менее часа"].append((channel, author, minutes))
+    return groups
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    update_embed.start()
+    update_tickets.start()
 
-@tasks.loop(minutes=2)
-async def update_embed():
-    global embed_messages
-    print("🔄 Запуск обновления embed")
+@bot.command()
+async def обновить(ctx):
+    global last_manual_update
+    now = asyncio.get_event_loop().time()
+    if now - last_manual_update < UPDATE_COOLDOWN:
+        await ctx.send("⏳ Подожди немного перед следующим обновлением.")
+        return
+    last_manual_update = now
+    await send_or_update_embed(ctx.channel)
 
-    channel = bot.get_channel(OUTPUT_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(OUTPUT_CHANNEL_ID)
-        except Exception as e:
-            print(f"❌ Не удалось получить канал по ID: {e}")
-            return
+@tasks.loop(seconds=UPDATE_INTERVAL)
+async def update_tickets():
+    channel = bot.get_channel(CHANNEL_ID)
+    if channel:
+        await send_or_update_embed(channel)
 
+async def send_or_update_embed(channel):
     guild = channel.guild
+    ticket_channels = [c for c in guild.text_channels if c.name.startswith("ticket")]
     support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
+    ticket_data = []
 
-    ticket_channels = [ch for ch in guild.text_channels if 'ticket' in ch.name]
-    print(f"🔍 Найдено {len(ticket_channels)} тикет-каналов")
-
-    tickets = []
-    for ch in ticket_channels:
-        try:
-            last_messages = [m async for m in ch.history(limit=1)]
-        except Exception as e:
+    for c in ticket_channels:
+        messages = [m async for m in c.history(limit=50)]
+        if not messages:
             continue
-        if not last_messages:
+        last_message = messages[0]
+        if support_role in last_message.author.roles or last_message.author.bot:
             continue
+        minutes_ago = int((datetime.now(timezone.utc) - last_message.created_at).total_seconds() // 60)
+        ticket_data.append((c, last_message.author, minutes_ago))
 
-        last_message = last_messages[0]
-        author = last_message.author
-        if support_role in getattr(author, 'roles', []) or author.bot:
+    grouped = group_by_age(ticket_data)
+
+    embeds = []
+    page = 1
+    total_pages = 1
+    description = ""
+    for group, items in grouped.items():
+        if not items:
             continue
+        block = f"**{group}**\n"
+        for c, author, min_ago in items:
+            block += f"<#{c.id}> — {min_ago} мин назад\n"
+        if len(description + block) > 4000:
+            embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{total_pages})", description=description, color=0xffcc00))
+            page += 1
+            description = ""
+        description += block + "\n"
+    embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{page})", description=description, color=0xffcc00))
 
-        message_time = last_message.created_at.replace(tzinfo=None)
-        now_time = discord.utils.utcnow().replace(tzinfo=None)
-        diff_minutes = int((now_time - message_time).total_seconds() // 60)
-        tickets.append((ch.name, ch.id, diff_minutes))
+    if not hasattr(channel, "last_embed_msg") or not hasattr(channel, "last_embed_pages"):
+        channel.last_embed_msg = await channel.send(embeds=embeds, view=UpdateView())
+        channel.last_embed_pages = embeds
+    else:
+        await channel.last_embed_msg.edit(embeds=embeds, view=UpdateView())
+        channel.last_embed_pages = embeds
 
-    tickets.sort(key=lambda x: x[2], reverse=True)
+class UpdateView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(UpdateButton())
 
-    groups = {
-        "🔥 **Старше 1 дня** (1440+ мин)": [],
-        "🟡 **От 1 до 3 часов** (60–180 мин)": [],
-        "🟢 **Менее часа**": []
-    }
+class UpdateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(style=discord.ButtonStyle.blurple, label="🔄 Обновить вручную")
 
-    for name, ch_id, minutes in tickets:
-        link = f"https://discord.com/channels/{guild.id}/{ch_id}"
-        line = f"[#{name}]({link}) — {minutes} мин назад"
-        if minutes >= 1440:
-            groups["🔥 **Старше 1 дня** (1440+ мин)"].append(line)
-        elif 60 <= minutes < 180:
-            groups["🟡 **От 1 до 3 часов** (60–180 мин)"].append(line)
-        else:
-            groups["🟢 **Менее часа**"].append(line)
+    async def callback(self, interaction: discord.Interaction):
+        await send_or_update_embed(interaction.channel)
+        await interaction.response.send_message("✅ Обновлено!", ephemeral=True)
 
-    for msg in embed_messages:
-        try:
-            await msg.delete()
-        except:
-            pass
-    embed_messages = []
-
-    pages = []
-    current = ""
-    for title, lines in groups.items():
-        if lines:
-            block = f"{title}\n" + "\n".join(lines) + "\n\n"
-            if len(current + block) > MAX_DESCRIPTION_LENGTH:
-                pages.append(current)
-                current = block
-            else:
-                current += block
-    if current:
-        pages.append(current)
-    if not pages:
-        pages = ["Нет тикетов, ожидающих ответа."]
-
-    for i, desc in enumerate(pages):
-        embed = discord.Embed(title=f"Тикеты, ожидающие ответа ({i+1}/{len(pages)})", description=desc, color=discord.Color.orange())
-        view = RefreshView()
-        try:
-            msg = await channel.send(embed=embed, view=view)
-            embed_messages.append(msg)
-        except Exception as e:
-            print(f"❌ Ошибка при отправке embed {i+1}: {e}")
-
-bot.run(os.environ["DISCORD_TOKEN"])
+bot.run(TOKEN)
