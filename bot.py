@@ -1,116 +1,127 @@
 
-import discord
-from discord.ext import tasks, commands
 import os
-import asyncio
-from datetime import datetime, timezone
-from collections import defaultdict
+import discord
+from discord.ext import commands, tasks
+from discord.ui import Button, View
+from datetime import datetime, timedelta
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = 1361521776760328253
+OUTPUT_CHANNEL_ID = 1361521776760328253
 SUPPORT_ROLE_NAME = "support"
-UPDATE_INTERVAL = 120  # каждые 2 минуты
-UPDATE_COOLDOWN = 10  # минимальное время между ручными обновлениями (сек)
+MAX_DESCRIPTION_LENGTH = 4000
+EMBED_REFRESH_INTERVAL = 2  # in minutes
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
-intents.messages = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-last_manual_update = 0
+bot = commands.Bot(command_prefix='!', intents=intents)
+last_manual_update = None
+embed_messages = []
 
-def group_by_age(ticket_data):
-    now = datetime.now(timezone.utc)
-    groups = {
-        "🔥 Старше 1 дня (1440+ мин)": [],
-        "🟡 От 1 до 3 часов (60–180 мин)": [],
-        "🟢 Менее часа": []
-    }
-    for channel, author, minutes in sorted(ticket_data, key=lambda x: x[2], reverse=True):
-        if minutes >= 1440:
-            groups["🔥 Старше 1 дня (1440+ мин)"].append((channel, author, minutes))
-        elif 60 <= minutes < 1440:
-            groups["🟡 От 1 до 3 часов (60–180 мин)"].append((channel, author, minutes))
-        else:
-            groups["🟢 Менее часа"].append((channel, author, minutes))
-    return groups
-
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    update_tickets.start()
-
-@bot.command()
-async def обновить(ctx):
-    global last_manual_update
-    now = asyncio.get_event_loop().time()
-    if now - last_manual_update < UPDATE_COOLDOWN:
-        await ctx.send("⏳ Подожди немного перед следующим обновлением.")
-        return
-    last_manual_update = now
-    await send_or_update_embed(ctx.channel)
-
-@tasks.loop(seconds=UPDATE_INTERVAL)
-async def update_tickets():
-    channel = bot.get_channel(CHANNEL_ID)
-    if channel:
-        await send_or_update_embed(channel)
-
-async def send_or_update_embed(channel):
-    guild = channel.guild
-    ticket_channels = [c for c in guild.text_channels if c.name.startswith("ticket")]
-    support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
-    ticket_data = []
-
-    for c in ticket_channels:
-        messages = [m async for m in c.history(limit=50)]
-        if not messages:
-            continue
-        last_message = messages[0]
-        if support_role in last_message.author.roles or last_message.author.bot:
-            continue
-        minutes_ago = int((datetime.now(timezone.utc) - last_message.created_at).total_seconds() // 60)
-        ticket_data.append((c, last_message.author, minutes_ago))
-
-    grouped = group_by_age(ticket_data)
-
-    embeds = []
-    page = 1
-    total_pages = 1
-    description = ""
-    for group, items in grouped.items():
-        if not items:
-            continue
-        block = f"**{group}**\n"
-        for c, author, min_ago in items:
-            block += f"<#{c.id}> — {min_ago} мин назад\n"
-        if len(description + block) > 4000:
-            embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{total_pages})", description=description, color=0xffcc00))
-            page += 1
-            description = ""
-        description += block + "\n"
-    embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{page})", description=description, color=0xffcc00))
-
-    if not hasattr(channel, "last_embed_msg") or not hasattr(channel, "last_embed_pages"):
-        channel.last_embed_msg = await channel.send(embeds=embeds, view=UpdateView())
-        channel.last_embed_pages = embeds
-    else:
-        await channel.last_embed_msg.edit(embeds=embeds, view=UpdateView())
-        channel.last_embed_pages = embeds
-
-class UpdateView(discord.ui.View):
+class UpdateView(View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(UpdateButton())
 
-class UpdateButton(discord.ui.Button):
+class UpdateButton(Button):
     def __init__(self):
-        super().__init__(style=discord.ButtonStyle.blurple, label="🔄 Обновить вручную")
+        super().__init__(label="🔄 Обновить вручную", style=discord.ButtonStyle.primary)
 
     async def callback(self, interaction: discord.Interaction):
-        await send_or_update_embed(interaction.channel)
-        await interaction.response.send_message("✅ Обновлено!", ephemeral=True)
+        global last_manual_update
+        now = datetime.utcnow()
+        if last_manual_update and (now - last_manual_update).total_seconds() < 10:
+            await interaction.response.send_message("⏱ Подожди немного перед повторным обновлением.", ephemeral=True)
+            return
+        last_manual_update = now
+        await update_tickets(interaction.channel)
+        await interaction.response.send_message("✅ Обновление выполнено!", ephemeral=True)
 
-bot.run(TOKEN)
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    update_loop.start()
+
+@tasks.loop(minutes=EMBED_REFRESH_INTERVAL)
+async def update_loop():
+    channel = bot.get_channel(OUTPUT_CHANNEL_ID)
+    if channel:
+        await update_tickets(channel)
+
+async def update_tickets(channel):
+    global embed_messages
+    guild = channel.guild
+    support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
+
+    ticket_channels = [ch for ch in guild.text_channels if "ticket" in ch.name]
+    print(f"🔍 Найдено {len(ticket_channels)} тикет-каналов")
+
+    tickets = []
+    for ch in ticket_channels:
+        messages = [m async for m in ch.history(limit=1)]
+        if not messages:
+            continue
+        last_message = messages[0]
+        author = last_message.author
+
+        try:
+            member = guild.get_member(author.id)
+            if member is None:
+                member = await guild.fetch_member(author.id)
+        except Exception as e:
+            print(f"❌ Ошибка при получении member: {e}")
+            continue
+
+        if support_role in member.roles or member.bot:
+            continue
+
+        now = datetime.utcnow().replace(tzinfo=None)
+        diff = int((now - last_message.created_at.replace(tzinfo=None)).total_seconds() // 60)
+        tickets.append((ch, diff))
+
+    # сортировка от старых к новым
+    tickets.sort(key=lambda x: x[1])
+
+    # группировка
+    grouped = {
+        "🔥 Старше 1 дня (1440+ мин)": [],
+        "🟡 От 1 до 3 часов (60–180 мин)": [],
+        "🟢 Менее часа": [],
+    }
+
+    for ch, mins in tickets:
+        line = f"[#{ch.name}](https://discord.com/channels/{guild.id}/{ch.id}) — {mins} мин назад"
+        if mins >= 1440:
+            grouped["🔥 Старше 1 дня (1440+ мин)"].append(line)
+        elif mins >= 60:
+            grouped["🟡 От 1 до 3 часов (60–180 мин)"].append(line)
+        else:
+            grouped["🟢 Менее часа"].append(line)
+
+    # удаление старых embed
+    for msg in embed_messages:
+        try:
+            await msg.delete()
+        except:
+            pass
+    embed_messages = []
+
+    description = ""
+    for section, lines in grouped.items():
+        if not lines:
+            continue
+        block = f"**{section}**\n" + "\n".join(lines) + "\n\n"
+        if len(description + block) > MAX_DESCRIPTION_LENGTH:
+            embed = discord.Embed(title="Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
+            msg = await channel.send(embed=embed, view=UpdateView())
+            embed_messages.append(msg)
+            description = ""
+        description += block
+
+    if description:
+        embed = discord.Embed(title="Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
+        msg = await channel.send(embed=embed, view=UpdateView())
+        embed_messages.append(msg)
+
+bot.run(os.getenv("DISCORD_TOKEN"))
