@@ -1,7 +1,7 @@
 
 import os
 import discord
-from discord.ext import tasks
+from discord.ext import commands, tasks
 
 # Настройки
 OUTPUT_CHANNEL_ID = 1361521776760328253  # ID канала, куда отправляется embed
@@ -12,7 +12,7 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = discord.ext.commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix='!', intents=intents)
 embed_message = None
 
 @bot.event
