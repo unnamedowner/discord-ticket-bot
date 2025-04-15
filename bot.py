@@ -9,8 +9,8 @@ from collections import defaultdict
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = 1361521776760328253
 SUPPORT_ROLE_NAME = "support"
-UPDATE_INTERVAL = 120  # каждые 2 минуты
-UPDATE_COOLDOWN = 10  # минимальное время между ручными обновлениями (сек)
+UPDATE_INTERVAL = 120
+UPDATE_COOLDOWN = 10
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -65,12 +65,17 @@ async def send_or_update_embed(channel):
     ticket_data = []
 
     for c in ticket_channels:
-        messages = [m async for m in c.history(limit=50)]
+        messages = [m async for m in c.history(limit=1)]
         if not messages:
             continue
         last_message = messages[0]
-        if support_role in last_message.author.roles or last_message.author.bot:
+
+        member = guild.get_member(last_message.author.id)
+        if member is None:
             continue
+        if support_role in member.roles or member.bot:
+            continue
+
         minutes_ago = int((datetime.now(timezone.utc) - last_message.created_at).total_seconds() // 60)
         ticket_data.append((c, last_message.author, minutes_ago))
 
@@ -78,7 +83,6 @@ async def send_or_update_embed(channel):
 
     embeds = []
     page = 1
-    total_pages = 1
     description = ""
     for group, items in grouped.items():
         if not items:
@@ -87,18 +91,16 @@ async def send_or_update_embed(channel):
         for c, author, min_ago in items:
             block += f"<#{c.id}> — {min_ago} мин назад\n"
         if len(description + block) > 4000:
-            embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{total_pages})", description=description, color=0xffcc00))
+            embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page})", description=description, color=0xffcc00))
             page += 1
             description = ""
         description += block + "\n"
-    embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page}/{page})", description=description, color=0xffcc00))
+    embeds.append(discord.Embed(title=f"Тикеты, ожидающие ответа ({page})", description=description, color=0xffcc00))
 
-    if not hasattr(channel, "last_embed_msg") or not hasattr(channel, "last_embed_pages"):
+    if not hasattr(channel, "last_embed_msg"):
         channel.last_embed_msg = await channel.send(embeds=embeds, view=UpdateView())
-        channel.last_embed_pages = embeds
     else:
         await channel.last_embed_msg.edit(embeds=embeds, view=UpdateView())
-        channel.last_embed_pages = embeds
 
 class UpdateView(discord.ui.View):
     def __init__(self):
