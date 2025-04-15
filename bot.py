@@ -5,6 +5,7 @@ from discord.ext import commands, tasks
 
 OUTPUT_CHANNEL_ID = 1361521776760328253
 SUPPORT_ROLE_NAME = "support"
+MAX_DESCRIPTION_LENGTH = 4000  # чуть меньше лимита на всякий случай
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -12,7 +13,7 @@ intents.guilds = True
 intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
-embed_message = None
+embed_messages = []
 
 @bot.event
 async def on_ready():
@@ -21,7 +22,7 @@ async def on_ready():
 
 @tasks.loop(minutes=2)
 async def update_embed():
-    global embed_message
+    global embed_messages
     print("🔄 Запуск обновления embed")
 
     channel = bot.get_channel(OUTPUT_CHANNEL_ID)
@@ -91,21 +92,36 @@ async def update_embed():
         channel_link = f"[#{ch.name}](https://discord.com/channels/{guild.id}/{ch.id})"
         ticket_list_lines.append(f"{channel_link} — {diff_minutes} мин назад")
 
-    embed = discord.Embed(title="Тикеты, ожидающие ответа", color=discord.Color.orange())
-    embed.description = "\n".join(ticket_list_lines) if ticket_list_lines else "Нет тикетов, ожидающих ответа."
+    # Удаляем старые embed-сообщения
+    for msg in embed_messages:
+        try:
+            await msg.delete()
+        except:
+            pass
+    embed_messages = []
 
-    try:
-        if embed_message is None:
-            embed_message = await channel.send(embed=embed)
-        else:
-            await embed_message.edit(embed=embed)
-        print("📬 Embed отправлен/обновлён")
-    except Exception as e:
-        print(f"❌ Ошибка при отправке/редактировании embed: {e}")
-        embed_message = None
+    # Формируем embed'ы по частям
+    pages = []
+    current_page = ""
+    for line in ticket_list_lines:
+        if len(current_page + line + "\n") > MAX_DESCRIPTION_LENGTH:
+            pages.append(current_page)
+            current_page = ""
+        current_page += line + "\n"
+    if current_page:
+        pages.append(current_page)
 
-token = os.getenv("DISCORD_TOKEN")
-if not token:
-    print("❌ Переменная окружения DISCORD_TOKEN не установлена!")
-else:
-    bot.run(token)
+    if not pages:
+        pages = ["Нет тикетов, ожидающих ответа."]
+
+    for i, desc in enumerate(pages):
+        embed = discord.Embed(
+            title=f"Тикеты, ожидающие ответа ({i+1}/{len(pages)})",
+            description=desc,
+            color=discord.Color.orange()
+        )
+        try:
+            msg = await channel.send(embed=embed)
+            embed_messages.append(msg)
+        except Exception as e:
+            print(f"❌ Ошибка при отправке embed {i+1}: {e}")
