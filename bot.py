@@ -125,3 +125,7 @@ async def update_embed():
             embed_messages.append(msg)
         except Exception as e:
             print(f"❌ Ошибка при отправке embed {i+1}: {e}")
+
+
+if __name__ == "__main__":
+    bot.run(os.environ["DISCORD_TOKEN"])
