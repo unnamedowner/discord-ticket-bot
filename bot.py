@@ -3,12 +3,13 @@ import discord
 from discord.ext import commands, tasks
 from discord.ui import Button, View
 from datetime import datetime
+import asyncio
 
-TOKEN = "MTM2MzY5MDAwMjQyODQ2MTE1OA.GZuQbR.r7IEfK-Jez39lRHro5GtYuOoa-b4h7nn3KKjZo"
-CHANNEL_ID = 1361521776760328253
+TOKEN = "MTM2MzY5MDAwMjQyODQ2MTE1OA.GooaWU.ZbYa-VqW9Cinz1F35-cK6NBjpuEx5DjsPPAT6c"
+OUTPUT_CHANNEL_ID = 1363689879690547380
 SUPPORT_ROLE_NAME = "support"
-COOLDOWN_SECONDS = 10
-EMBED_REFRESH_INTERVAL = 2  # in minutes
+MAX_DESCRIPTION_LENGTH = 4000
+EMBED_REFRESH_INTERVAL = 2
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -31,86 +32,95 @@ class UpdateButton(Button):
     async def callback(self, interaction: discord.Interaction):
         global last_manual_update
         now = datetime.utcnow()
-        if last_manual_update and (now - last_manual_update).total_seconds() < COOLDOWN_SECONDS:
+        if last_manual_update and (now - last_manual_update).total_seconds() < 10:
             await interaction.response.send_message("⏱ Подожди немного перед повторным обновлением.", ephemeral=True)
             return
         last_manual_update = now
         await interaction.response.defer(ephemeral=True)
-        await update_tickets(interaction.guild, interaction.channel)
+        await update_tickets(interaction.channel)
         await interaction.followup.send("✅ Обновление выполнено!", ephemeral=True)
 
 @bot.event
 async def on_ready():
-    print(f"Бот запущен как {bot.user}")
+    print("Бот запущен и готов к работе.")
     update_loop.start()
 
 @tasks.loop(minutes=EMBED_REFRESH_INTERVAL)
 async def update_loop():
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = bot.get_channel(OUTPUT_CHANNEL_ID)
     if channel:
-        await update_tickets(channel.guild, channel)
+        await update_tickets(channel)
 
-async def update_tickets(guild, channel):
+async def update_tickets(channel):
     global embed_messages
+    guild = channel.guild
     support_role = discord.utils.get(guild.roles, name=SUPPORT_ROLE_NAME)
 
     ticket_channels = [ch for ch in guild.text_channels if "ticket" in ch.name]
+    print(f"🔍 Найдено {len(ticket_channels)} тикет-каналов")
+
+    tickets = []
+    for ch in ticket_channels:
+        messages = [m async for m in ch.history(limit=1)]
+        if not messages:
+            continue
+        last_message = messages[0]
+        author = last_message.author
+
+        try:
+            member = guild.get_member(author.id)
+            if member is None:
+                member = await guild.fetch_member(author.id)
+        except Exception as e:
+            print(f"❌ Ошибка при получении member: {e}")
+            continue
+
+        if support_role in member.roles or member.bot:
+            continue
+
+        now = datetime.utcnow().replace(tzinfo=None)
+        diff = int((now - last_message.created_at.replace(tzinfo=None)).total_seconds() // 60)
+        tickets.append((ch, diff))
+
+    tickets.sort(key=lambda x: x[1])
+
     grouped = {
         "🔥 Старше 3 часов (180+ мин)": [],
         "🟡 От 1 до 3 часов (60–180 мин)": [],
         "🟢 Менее часа": [],
     }
 
-    for ch in ticket_channels:
-        try:
-            messages = [m async for m in ch.history(limit=1)]
-            if not messages:
-                continue
-            msg = messages[0]
-            author = msg.author
-
-            try:
-                member = guild.get_member(author.id) or await guild.fetch_member(author.id)
-            except:
-                continue
-
-            if member.bot or support_role in member.roles:
-                continue
-
-            minutes = int((datetime.utcnow() - msg.created_at).total_seconds() // 60)
-            link = f"[#{ch.name}](https://discord.com/channels/{guild.id}/{ch.id}) — {minutes} мин назад"
-
-            if minutes >= 180:
-                grouped["🔥 Старше 1 дня (1440+ мин)"].append(link)
-            elif minutes >= 60:
-                grouped["🟡 От 1 до 3 часов (60–180 мин)"].append(link)
-            else:
-                grouped["🟢 Менее часа"].append(link)
-
-        except Exception as e:
-            print(f"Ошибка в канале {ch.name}: {e}")
+    for ch, mins in tickets:
+        line = f"[#{ch.name}](https://discord.com/channels/{guild.id}/{ch.id}) — {mins} мин назад"
+        if mins >= 180:
+            grouped["🔥 Старше 3 часов (180+ мин)"].append(line)
+        elif mins >= 60:
+            grouped["🟡 От 1 до 3 часов (60–180 мин)"].append(line)
+        else:
+            grouped["🟢 Менее часа"].append(line)
 
     for msg in embed_messages:
         try:
             await msg.delete()
         except:
             pass
-    embed_messages.clear()
+    embed_messages = []
 
     description = ""
-    for group, items in grouped.items():
-        if not items:
+    for section, lines in grouped.items():
+        if not lines:
             continue
-        block = f"**{group}**\n" + "\n".join(items) + "\n\n"
-        if len(description + block) > 4000:
-            embed = discord.Embed(title="⏳ Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
+        block = f"**{section}**
+" + "\n".join(lines) + "\n\n"
+        if len(description + block) > MAX_DESCRIPTION_LENGTH:
+            embed = discord.Embed(title="Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
             msg = await channel.send(embed=embed, view=UpdateView())
             embed_messages.append(msg)
             description = ""
         description += block
 
     if description:
-        embed = discord.Embed(title="⏳ Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
+        embed = discord.Embed(title="Тикеты, ожидающие ответа", description=description, color=discord.Color.orange())
         msg = await channel.send(embed=embed, view=UpdateView())
         embed_messages.append(msg)
 
